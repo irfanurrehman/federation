@@ -80,20 +80,18 @@ function kube::release::package_tarballs() {
   # Clean out any old releases
   rm -rf "${RELEASE_STAGE}" "${RELEASE_TARS}" "${RELEASE_IMAGES}"
   mkdir -p "${RELEASE_TARS}"
+
   kube::release::package_src_tarball &
   kube::release::package_client_tarballs &
-  kube::release::package_salt_tarball &
-  kube::release::package_kube_manifests_tarball &
   kube::util::wait-for-jobs || { kube::log::error "previous tarball phase failed"; return 1; }
 
-  # _node and _server tarballs depend on _src tarball
-  kube::release::package_node_tarballs &
   kube::release::package_server_tarballs &
   kube::util::wait-for-jobs || { kube::log::error "previous tarball phase failed"; return 1; }
 
-  kube::release::package_final_tarball & # _final depends on some of the previous phases
-  kube::release::package_test_tarball & # _test doesn't depend on anything
-  kube::util::wait-for-jobs || { kube::log::error "previous tarball phase failed"; return 1; }
+  #TODO (maru/irfan) this needs to be updated once e2e builds
+  #kube::release::package_final_tarball &# _final depends on some of the previous phases
+  #kube::release::package_test_tarball & # _test doesn't depend on anything
+  kube::log::status "Completed federation release build."
 }
 
 # Package the source code we built, for compliance/licensing/audit/yadda.
@@ -109,7 +107,7 @@ function kube::release::package_src_tarball() {
         \) -prune \
       \))
   )
-  "${TAR}" czf "${RELEASE_TARS}/kubernetes-src.tar.gz" -C "${KUBE_ROOT}" "${source_files[@]}"
+  "${TAR}" czf "${RELEASE_TARS}/federation-src.tar.gz" -C "${KUBE_ROOT}" "${source_files[@]}"
 }
 
 # Package up all of the cross compiled clients. Over time this should grow into
@@ -120,10 +118,10 @@ function kube::release::package_client_tarballs() {
   platforms=($(cd "${LOCAL_OUTPUT_BINPATH}" ; echo */*))
   for platform in "${platforms[@]}"; do
     local platform_tag=${platform/\//-} # Replace a "/" for a "-"
-    kube::log::status "Starting tarball: client $platform_tag"
+    kube::log::status "Building tarball: client $platform_tag"
 
     (
-      local release_stage="${RELEASE_STAGE}/client/${platform_tag}/kubernetes"
+      local release_stage="${RELEASE_STAGE}/client/${platform_tag}/federation"
       rm -rf "${release_stage}"
       mkdir -p "${release_stage}/client/bin"
 
@@ -140,7 +138,7 @@ function kube::release::package_client_tarballs() {
 
       kube::release::clean_cruft
 
-      local package_name="${RELEASE_TARS}/kubernetes-client-${platform_tag}.tar.gz"
+      local package_name="${RELEASE_TARS}/federation-client-${platform_tag}.tar.gz"
       kube::release::create_tarball "${package_name}" "${release_stage}/.."
     ) &
   done
@@ -199,20 +197,32 @@ function kube::release::package_server_tarballs() {
   for platform in "${KUBE_SERVER_PLATFORMS[@]}"; do
     local platform_tag=${platform/\//-} # Replace a "/" for a "-"
     local arch=$(basename ${platform})
+    local images_dir="${RELEASE_IMAGES}/${arch}"
+    mkdir -p "${images_dir}"
+
+    local -r docker_registry="gcr.io/google_containers"
+    # Clean out any old releases
     kube::log::status "Building tarball: server $platform_tag"
 
-    local release_stage="${RELEASE_STAGE}/server/${platform_tag}/kubernetes"
+    # Docker tags cannot contain '+'
+    local docker_tag="${KUBE_GIT_VERSION/+/_}"
+    if [[ -z "${docker_tag}" ]]; then
+      kube::log::error "git version information missing; cannot create Docker tag"
+      return 1
+    fi
+
+    fed::release::build_fcp_image "${arch}" "${docker_registry}" \
+        "${docker_tag}" "${images_dir}"
+
+    local release_stage="${RELEASE_STAGE}/server/${platform_tag}/federation"
     rm -rf "${release_stage}"
     mkdir -p "${release_stage}/server/bin"
-    mkdir -p "${release_stage}/addons"
 
     # This fancy expression will expand to prepend a path
     # (${LOCAL_OUTPUT_BINPATH}/${platform}/) to every item in the
     # KUBE_SERVER_BINARIES array.
     cp "${KUBE_SERVER_BINARIES[@]/#/${LOCAL_OUTPUT_BINPATH}/${platform}/}" \
       "${release_stage}/server/bin/"
-
-    kube::release::create_docker_images_for_server "${release_stage}/server/bin" "${arch}"
 
     # Include the client binaries here too as they are useful debugging tools.
     local client_bins=("${KUBE_CLIENT_BINARIES[@]}")
@@ -222,13 +232,16 @@ function kube::release::package_server_tarballs() {
     cp "${client_bins[@]/#/${LOCAL_OUTPUT_BINPATH}/${platform}/}" \
       "${release_stage}/server/bin/"
 
-    cp "${KUBE_ROOT}/Godeps/LICENSES" "${release_stage}/"
+    #TODO (irfan) Do we need this license file and any other src file/script in release.
+    #cp "${KUBE_ROOT}/Godeps/LICENSES" "${release_stage}/"
+    cp "${RELEASE_TARS}/federation-src.tar.gz" "${release_stage}/"
 
-    cp "${RELEASE_TARS}/kubernetes-src.tar.gz" "${release_stage}/"
+    #copy out fcp image
+    cp "${images_dir}/fcp-${arch}.tar" "${release_stage}/"
 
     kube::release::clean_cruft
 
-    local package_name="${RELEASE_TARS}/kubernetes-server-${platform_tag}.tar.gz"
+    local package_name="${RELEASE_TARS}/federation-server-${platform_tag}.tar.gz"
     kube::release::create_tarball "${package_name}" "${release_stage}/.."
   done
 }
@@ -266,6 +279,26 @@ function kube::release::build_hyperkube_image() {
     # not a release
     kube::log::status "Deleting hyperkube image ${hyperkube_tag}"
     "${DOCKER[@]}" rmi "${hyperkube_tag}" &>/dev/null || true
+  fi
+}
+
+function fed::release::build_fcp_image() {
+  local -r arch="$1"
+  local -r registry="$2"
+  local -r version="$3"
+  local -r save_dir="${4-}"
+  kube::log::status "Building fcp image for arch: ${arch}"
+  ARCH="${arch}" REGISTRY="${registry}" VERSION="${version}" \
+    make -C image build >/dev/null
+
+  local fcp_tag="${registry}/fcp-${arch}:${version}"
+  if [[ -n "${save_dir}" ]]; then
+    "${DOCKER[@]}" save "${fcp_tag}" > "${save_dir}/fcp-${arch}.tar"
+  fi
+  if [[ -z "${KUBE_DOCKER_IMAGE_TAG-}" || -z "${KUBE_DOCKER_REGISTRY-}" ]]; then
+    # not a release
+    kube::log::status "Deleting fcp image ${fcp_tag}"
+    "${DOCKER[@]}" rmi "${fcp_tag}" &>/dev/null || true
   fi
 }
 
@@ -535,5 +568,5 @@ function kube::release::create_tarball() {
   local tarfile=$1
   local stagingdir=$2
 
-  "${TAR}" czf "${tarfile}" -C "${stagingdir}" kubernetes --owner=0 --group=0
+  "${TAR}" czf "${tarfile}" -C "${stagingdir}" federation --owner=0 --group=0
 }
