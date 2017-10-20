@@ -711,7 +711,7 @@ func createPVC(clientset client.Interface, namespace, svcName, federationName, e
 
 func createAPIServer(clientset client.Interface, namespace, name, federationName, serverImage, etcdImage, advertiseAddress, credentialsName string, hasHTTPBasicAuthFile, hasTokenAuthFile bool, argOverrides map[string]string, pvc *api.PersistentVolumeClaim, dryRun bool, nodeSelector map[string]string) (*extensions.Deployment, error) {
 	command := []string{
-		"/hyperkube",
+		"/fcp",
 		"federation-apiserver",
 	}
 	argsMap := map[string]string{
@@ -886,7 +886,7 @@ func createRoleBindings(clientset client.Interface, namespace, saName, federatio
 
 func createControllerManager(clientset client.Interface, namespace, name, svcName, cmName, image, kubeconfigName, dnsZoneName, dnsProvider, dnsProviderConfig, saName string, dnsProviderSecret *api.Secret, argOverrides map[string]string, dryRun bool, nodeSelector map[string]string) (*extensions.Deployment, error) {
 	command := []string{
-		"/hyperkube",
+		"/fcp",
 		"federation-controller-manager",
 	}
 	argsMap := map[string]string{
