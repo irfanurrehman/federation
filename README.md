@@ -1,26 +1,24 @@
 # Cluster Federation
 
 Kubernetes Cluster Federation enables users to federate multiple
-Kubernetes clusters. Please see the [user guide](https://kubernetes.io/docs/concepts/cluster-administration/federation-service-discovery/)
-and the [admin guide](https://kubernetes.io/docs/tutorials/federation/set-up-cluster-federation-kubefed/)
-for more details about setting up and using the Cluster Federation.
+Kubernetes clusters.
+To know more details about the same please see the
+[user guide](https://kubernetes.io/docs/concepts/cluster-administration/federation/).
+
+# Deploying Kubernetes Cluster Federation
+
+The prescribed mechanism to deploy Kubernetes Cluster Federation is using
+[kubefed](https://kubernetes.io/docs/admin/kubefed/).
+A complete guide for the same is available at
+[setup cluster federation using kubefed](https://kubernetes.io/docs/tutorials/federation/set-up-cluster-federation-kubefed/).
 
 # Building Kubernetes Cluster Federation
 
-Please see the [Kubernetes Development Guide](https://github.com/kubernetes/community/blob/master/contributors/devel/development.md)
-for initial setup. Once you have the development environment setup
-as explained in that guide, you also need to install [`jq`](https://stedolan.github.io/jq/download/)
-<!-- TODO(madhusudancs): Re-evaluate using jq even in the development
-     environment. There is a concern that adding more tools as dependencies
-     might lead to proliferation of tools one need to install to develop
-     Kubernetes. jq is already a dependency for kubernetes-anywhere on
-     which this workflow depends, so we are giving an exception to jq
-     for now. -->
-
-Building cluster federation artifacts should be as simple as running:
+Building cluster federation binaries, which include fcp (short for federation
+control plane) and should be as simple as running:
 
 ```shell
-make build
+make
 ```
 
 You can specify the docker registry to tag the image using the
