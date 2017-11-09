@@ -24,14 +24,15 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	//"k8s.io/apimachinery/pkg/runtime/schema"
 	federationapi "k8s.io/federation/apis/federation/v1beta1"
 	"k8s.io/federation/pkg/kubefed/util"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/resource"
+	//"k8s.io/kubernetes/pkg/kubectl/resource"
+	fedclient "k8s.io/federation/client/clientset_generated/federation_clientset"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -170,38 +171,25 @@ func (u *unjoinFederation) Run(f cmdutil.Factory, cmdOut, cmdErr io.Writer, conf
 // popCluster fetches the cluster object with the given name, deletes
 // it and returns the deleted cluster object.
 func popCluster(f cmdutil.Factory, name string) (*federationapi.Cluster, error) {
-	mapper, typer := f.Object()
-	gvks, _, err := typer.ObjectKinds(&federationapi.Cluster{})
+	clientConfig, err := f.ClientConfig()
 	if err != nil {
-		return nil, err
-	}
-	gvk := gvks[0]
-	mapping, err := mapper.RESTMapping(schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind}, gvk.Version)
-	if err != nil {
-		return nil, err
-	}
-	client, err := f.ClientForMapping(mapping)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Could not get a client config from client factory: %v", err)
 	}
 
-	rh := resource.NewHelper(client, mapping)
-	obj, err := rh.Get("", name, false)
+	fedClient, err := fedclient.NewForConfig(clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("Could not get a federation client from client config: %v", err)
+	}
 
+	cluster, err := fedClient.FederationV1beta1().Clusters().Get(name, metav1.GetOptions{})
 	if isNotFound(err) {
 		// Cluster isn't registered, there isn't anything to be done here.
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	cluster, ok := obj.(*federationapi.Cluster)
-	if !ok {
-		return nil, fmt.Errorf("unexpected object type: expected \"federation/v1beta1.Cluster\", got %T: obj: %#v", obj, obj)
-	}
 
-	// Remove the cluster resource in the federation API server by
-	// calling rh.Delete()
-	return cluster, rh.Delete("", name)
+	return cluster, fedClient.FederationV1beta1().Clusters().Delete(name, &metav1.DeleteOptions{})
 }
 
 func updateConfigMapFromCluster(hostClientset, unjoiningClusterClientset internalclientset.Interface, fedSystemNamespace string) error {
