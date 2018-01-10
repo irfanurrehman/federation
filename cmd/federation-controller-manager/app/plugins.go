@@ -21,6 +21,7 @@ package app
 // given binary target.
 import (
 	// DNS providers
+        _ "k8s.io/federation/pkg/dnsprovider/providers/azure/azuredns"
 	_ "k8s.io/federation/pkg/dnsprovider/providers/aws/route53"
 	_ "k8s.io/federation/pkg/dnsprovider/providers/coredns"
 	_ "k8s.io/federation/pkg/dnsprovider/providers/google/clouddns"
