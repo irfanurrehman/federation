@@ -241,10 +241,10 @@ func (a *replicaSchedulingAdapter) ScheduleObject(cluster *federationapi.Cluster
 	}
 
 	var action ScheduleAction = ""
-	specReplicas := int32(0)
+	specReplicas := int32(1)
 	// If the cluster has been selected (isSelected = true; for example by hpa)
 	// and the obj does not get any replicas, then it should create one with
-	// 0 replicas (which can then be scaled by hpa in that cluster).
+	// 1 replicas (which can then be scaled by hpa in that cluster).
 	// On the other hand we keep the action as "unassigned" if this cluster was
 	// not selected, and let the sync controller decide what to do.
 	if clusterScheduleState.isSelected {

@@ -30,10 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	kubeclientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	fed "k8s.io/federation/apis/federation"
 	federationapi "k8s.io/federation/apis/federation/v1beta1"
 	federationclientset "k8s.io/federation/client/clientset_generated/federation_clientset"
 	fedutil "k8s.io/federation/pkg/federation-controller/util"
 	hpautil "k8s.io/federation/pkg/federation-controller/util/hpa"
+	"k8s.io/federation/pkg/federation-controller/util/replicapreferences"
 	extensionsinternal "k8s.io/kubernetes/pkg/apis/extensions"
 
 	"github.com/golang/glog"
@@ -49,7 +51,8 @@ const (
 	// This is a tunable which does not change replica nums
 	// on an existing local hpa, before this timeout, if it
 	// did scale already (avoids thrashing of replicas around).
-	ScaleForbiddenWindow = 2 * time.Minute
+	ScaleForbiddenWindow        = 2 * time.Minute
+	FedHPAPreferencesAnnotation = "federation.kubernetes.io/hpa-preferences"
 )
 
 func init() {
@@ -272,6 +275,9 @@ func getCurrentClusterObjs(informer fedutil.FederatedInformer, key string, clust
 			currentClusterObjs[clusterName] = clusterObj.(pkgruntime.Object)
 		}
 	}
+	if len(currentClusterObjs) == 0 {
+		return nil, fmt.Errorf("FEderated HPA: No clusters currently registered with federation")
+	}
 	return currentClusterObjs, nil
 }
 
@@ -331,6 +337,24 @@ func (a *HpaAdapter) getHpaScheduleState(fedObj pkgruntime.Object, currentObjs m
 		rdc.max = 2
 	}
 
+	// TODO: Ignoring error, if error ignoring preferences as of now
+	// Implement a very basic mechanism to be able to specify preferred cluster
+	// and max and min (importantly max) for the same.
+	fedPref, err := replicapreferences.GetAllocationPreferences(fedHpa, FedHPAPreferencesAnnotation)
+	if err != nil {
+		glog.Errorf("/n/n/n#######Fed IRF HPA: Error reading annotation: %v | %v/n/n/n", fedPref, err)
+		fedPref = nil
+	}
+
+	glog.Infof("/n/n/n#######Fed IRF HPA: READ annotation: %v /n/n/n", fedPref)
+
+	preferredState, overflow := a.allocateInPreferredCluster(fedPref, requestedReplicas, currentObjs)
+	glog.Errorf("/n/n/n#######Fed IRF HPA: Ran Allocation preference : preferredState:%v | /n/n overflow:%v/n/n/n", preferredState, overflow)
+	if preferredState != nil && overflow == nil {
+		glog.Infof("/n/n/n#######Fed IRF HPA: Returned preferredState:%v | /n/n /n/n", preferredState)
+		return preferredState
+	}
+
 	// Pass 1: Analyse existing local hpa's if any.
 	// clusterLists holds the list of those clusters which can offer
 	// min and max replicas, to those which want them.
@@ -341,9 +365,15 @@ func (a *HpaAdapter) getHpaScheduleState(fedObj pkgruntime.Object, currentObjs m
 	// It will eventually have desired status for this reconcile.
 	clusterLists, currentReplicas, scheduleState := a.prepareForScheduling(currentObjs)
 
-	remainingReplicas := replicaNums{
-		min: requestedReplicas.min - currentReplicas.min,
-		max: requestedReplicas.max - currentReplicas.max,
+	glog.Infof("/n/n/n#######Fed IRF HPA: prepared scheduleState:%v | /n/n /n/n", scheduleState)
+
+	remainingReplicas := replicaNums{min: 0, max: 0}
+	if overflow != nil {
+		remainingReplicas.min = overflow.min - currentReplicas.min
+		remainingReplicas.max = overflow.max - currentReplicas.max
+	} else {
+		remainingReplicas.min = requestedReplicas.min - currentReplicas.min
+		remainingReplicas.max = requestedReplicas.max - currentReplicas.max
 	}
 
 	// Pass 2: reduction of replicas if needed ( situation that fedHpa updated replicas
@@ -390,6 +420,8 @@ func (a *HpaAdapter) getHpaScheduleState(fedObj pkgruntime.Object, currentObjs m
 	// but min remains 0.
 	a.distributeMinReplicas(toDistribute.min, clusterLists, rdc, currentObjs, scheduleState)
 
+	glog.Infof("/n/n/n#######Fed IRF HPA: MERGING preferredState: %v scheduleState:%v | /n/n /n/n", preferredState, scheduleState)
+	mergeScheduleStates(preferredState, scheduleState)
 	return finaliseScheduleState(scheduleState)
 }
 
@@ -434,7 +466,9 @@ func (a *HpaAdapter) ScheduleObject(cluster *federationapi.Cluster, clusterObj p
 	case clusterHpaState != nil && clusterObj == nil:
 		return desiredHpa, ActionAdd, nil
 	case clusterHpaState == nil && clusterObj != nil:
-		return nil, ActionDelete, nil
+		// This is the object which the operations accessor
+		// passes to the delete handler, which needs an object
+		return clusterObj, ActionDelete, nil
 	}
 	return nil, defaultAction, nil
 }
@@ -491,10 +525,80 @@ func updateStatus(fedHpa *autoscalingv1.HorizontalPodAutoscaler, newStatus hpaFe
 	return needUpdate, newFedHpaStatus
 }
 
+func (a *HpaAdapter) allocateInPreferredCluster(fedPref *fed.ReplicaAllocationPreferences, requestedReplicas replicaNums, currentObjs map[string]pkgruntime.Object) (map[string]*replicaNums, *replicaNums) {
+	preferredState := make(map[string]*replicaNums)
+	var overflow = &replicaNums{min: int32(0), max: int32(0)}
+
+	// This currently assumes that only one cluster has a
+	// weight specified. It will randomly pick one if more have
+	// weights and the results will be wrong.
+	// TODO: Implement a descending order of weighted selection
+	if (fedPref != nil) && len(fedPref.Clusters) > 0 {
+		for clusterName, pref := range fedPref.Clusters {
+			if pref.Weight > 0 {
+				// Ignore if the cluster name isn't
+				// among the joined clusters
+				if _, ok := currentObjs[clusterName]; !ok {
+					continue
+				}
+
+				r := replicaNums{min: int32(0), max: int32(0)}
+				if pref.MaxReplicas != nil {
+					r.max = int32(*pref.MaxReplicas)
+				}
+				r.min = int32(pref.MinReplicas)
+				preferredState[clusterName] = &r
+
+				// Some basic checks on wrong values in preferences
+				// Ignore if that is the case
+				if (requestedReplicas.max < r.max) ||
+					(requestedReplicas.min < r.min) ||
+					(r.min > r.max) {
+					return nil, nil
+				}
+
+				// If the preferred cluster already has an hpa, check
+				// if its current utilisation is well within limits.
+				// If that is the case, all other clusters loose the hpa
+				// and no replicas overflow even if federated hpa specifies
+				// higher limits.
+				if obj := currentObjs[clusterName]; obj != nil {
+					if a.maxReplicasNeeded(obj) {
+						glog.Infof("/n/n/n#######Fed IRF HPA: Running at full capacity/n/n/n")
+						// This means that our guy is already running
+						// at full capacity. We should overflow.
+						overflow.max = requestedReplicas.max - r.max
+						overflow.min = requestedReplicas.min - r.min
+
+						// The overflow will be allocated to remaining clusters.
+						delete(currentObjs, clusterName)
+						return preferredState, overflow
+					}
+				}
+				// No need to overflow as preferred cluster replicas
+				// are either within limits or this is the first time this HPA
+				// is getting created in preferred cluster. Remove hpas from
+				// other clusters if they exist already.
+				for name := range currentObjs {
+					if name == clusterName {
+						continue
+					}
+					preferredState[name] = nil
+				}
+				return preferredState, nil
+			}
+		}
+	}
+
+	return nil, nil
+}
+
 // prepareForScheduling prepares the lists and totals from the
 // existing objs.
 // currentObjs has the list of all clusters, with obj as nil
 // for those clusters which do not have hpa yet.
+// It also checks if any cluster is preferred in federation object
+// annotations, and adds that information to scheduleState
 func (a *HpaAdapter) prepareForScheduling(currentObjs map[string]pkgruntime.Object) (hpaLists, replicaNums, map[string]*replicaNums) {
 	lists := hpaLists{
 		availableMax: sets.NewString(),
@@ -688,6 +792,11 @@ func (a *HpaAdapter) distributeMaxReplicas(toDistributeMax int32, lists hpaLists
 		}
 	} else { // we have no new clusters but if still have max replicas to distribute;
 		// just distribute all in current clusters.
+		if len(scheduled) == 0 {
+			// no point trying as there is no cluster
+			// where we can distribute replicas
+			return toDistributeMax
+		}
 		for toDistributeMax > 0 {
 			for cluster, replicas := range scheduled {
 				if replicas == nil {
@@ -790,6 +899,9 @@ func (a *HpaAdapter) distributeMinReplicas(toDistributeMin int32, lists hpaLists
 		}
 	} else { // we have no new clusters but if still have min replicas to distribute;
 		// just distribute all in current clusters.
+		if len(scheduled) == 0 {
+			return toDistributeMin
+		}
 		for toDistributeMin > 0 {
 			for _, replicas := range scheduled {
 				if replicas == nil {
@@ -824,6 +936,19 @@ func (a *HpaAdapter) distributeMinReplicas(toDistributeMin int32, lists hpaLists
 		}
 	}
 	return toDistributeMin
+}
+
+// Preferred will actually have only 1 cluster hpa
+// If we have reached here that means we need to add this
+// cluster hpa detail to the schedule state.
+func mergeScheduleStates(preferred, scheduled map[string]*replicaNums) {
+	for clusterName, replicas := range preferred {
+		if (replicas != nil) {
+			r := replicaNums{min: replicas.min, max: replicas.max}
+			scheduled[clusterName] = &r
+			break
+		}
+	}
 }
 
 // finaliseScheduleState ensures that the minReplica count is made to 1
